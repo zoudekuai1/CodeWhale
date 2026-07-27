@@ -17,16 +17,16 @@ jobs:
       image: centos:7.9.2009
       options: --privileged
     steps:
-      - name: 1. 安装基础系统依赖
+      - name: 1. 修复CentOS7 yum源 + 安装系统依赖
         run: |
           set -e
-          yum install -y epel-release centos-release-scl
-          yum clean all && yum makecache fast
-          # 基础编译工具
-          yum install -y git wget unzip xz make autoconf automake libtool patch
-          # devtoolset9 高版本gcc，解决centos7 gcc4.8.5缺陷
+          mv /etc/yum.repos.d/CentOS-Base.repo /etc/yum.repos.d/CentOS-Base.repo.bak
+          curl -o /etc/yum.repos.d/CentOS-Base.repo https://mirrors.aliyun.com/repo/Centos-7.repo
+          curl -o /etc/yum.repos.d/epel.repo https://mirrors.aliyun.com/repo/epel-7.repo
+          yum clean all
+          yum makecache fast
+          yum install -y centos-release-scl wget curl unzip xz make autoconf automake libtool patch git
           yum install -y devtoolset-9-gcc devtoolset-9-gcc-c++ devtoolset-9-make
-          # 静态系统库
           yum install -y glibc-static libstdc++-static zlib-static openssl-static
 
       - name: 2. 拉取源码
