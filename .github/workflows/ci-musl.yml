@@ -43,32 +43,46 @@ jobs:
           fi
         }
         
-        # 1. 替换 CentOS Base 基础源
+        # 1. 替换 CentOS Base 基础源（可用）
         download \
           /etc/yum.repos.d/CentOS-Base.repo \
           https://mirrors.aliyun.com/repo/Centos-7.repo \
           https://mirrors.163.com/.help/CentOS7-Base-163.repo
           
-        # 2. 替换 EPEL 源
+        # 2. 替换 EPEL 源（可用）
         download \
           /etc/yum.repos.d/epel.repo \
           https://mirrors.aliyun.com/repo/epel-7.repo \
           https://mirrors.163.com/epel/epel.repo
-          
-        # 3. SCL软件源修复（移除失效网易SCL链接，仅阿里可用兜底）
-        download \
-          /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo \
-          https://mirrors.aliyun.com/repo/Centos-7-sclo.repo \
-          https://mirrors.aliyun.com/repo/Centos-7-sclo.repo
-          
+    
+        # ========== 本地静态生成SCL源，彻底规避404 ==========
+        echo "本地写入CentOS SCL软件源配置"
+        cat > /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo <<EOT
+        [centos-sclo-sclo]
+        name=CentOS-7 - SCLo sclo
+        baseurl=https://mirrors.aliyun.com/centos/7/sclo/\$basearch/sclo/
+        gpgcheck=1
+        enabled=1
+        gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+        
+        [centos-sclo-rh]
+        name=CentOS-7 - SCLo rh
+        baseurl=https://mirrors.aliyun.com/centos/7/sclo/\$basearch/rh/
+        gpgcheck=1
+        enabled=1
+        gpgkey=https://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
+        EOT
+
+              
         # 清理缓存并重建
         yum clean all
         yum makecache fast -e 0
         
-        # 一次性批量安装全部依赖，减少yum调用次数
+        # 一次性批量安装全部依赖
         yum install -y wget curl unzip xz make cmake3 autoconf automake libtool patch git golang
         yum install -y devtoolset-9-gcc devtoolset-9-gcc-c++ devtoolset-9-make
         yum install -y glibc-static libstdc++-static zlib-static openssl-static
+
 
     - name: 2. 拉取源码
       uses: actions/checkout@v4
