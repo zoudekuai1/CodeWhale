@@ -1,49 +1,141 @@
-name: Musl Release Build
+name: Build Musl Static Binary (CentOS7.9)
+
+# 触发规则：push main/develop、PR、手动触发
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
+# 单Job：centos7.9容器构建
 jobs:
-  build-linux-musl-x64:
+  build-musl-centos7:
     runs-on: ubuntu-latest
+    container:
+      # 官方纯净 CentOS7.9 镜像，匹配运行环境
+      image: centos:7.9.2009
+      options: --privileged
     steps:
-      - uses: actions/checkout@v4
-
-      # 安装Rust + musl编译目标
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: x86_64-unknown-linux-musl
-          override: true
-
-      # 静态编译，内置所有依赖，关闭动态链接
-      - name: Build musl static binary
-        env:
-          # 强制静态编译所有第三方库
-          OPENSSL_STATIC: 1
-          OPENSSL_VENDOR: 1
+      - name: 1. 安装基础系统依赖
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl --features vendored-openssl
-          # 重命名产物
-          mv target/x86_64-unknown-linux-musl/release/codewhale codewhale-linux-musl-x86_64
+          set -e
+          yum install -y epel-release centos-release-scl
+          yum clean all && yum makecache fast
+          # 基础编译工具
+          yum install -y git wget unzip xz make autoconf automake libtool patch
+          # devtoolset9 高版本gcc，解决centos7 gcc4.8.5缺陷
+          yum install -y devtoolset-9-gcc devtoolset-9-gcc-c++ devtoolset-9-make
+          # 静态系统库
+          yum install -y glibc-static libstdc++-static zlib-static openssl-static
 
-      # 上传制品
-      - name: Upload binary
+      - name: 2. 拉取源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1 # 浅克隆加速CI
+
+      - name: 3. 缓存musl工具链（重复构建无需重编译musl）
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/musl-toolchain
+          key: musl-v1.2.5-centos7
+
+      - name: 4. 编译musl-libc静态工具链（无缓存时执行）
+        if: steps.cache-musl.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          source /opt/rh/devtoolset-9/enable
+          MUSL_VER=1.2.5
+          WORK_ROOT=${{ github.workspace }}
+          MUSL_PREFIX=$WORK_ROOT/musl-toolchain
+          mkdir -p $WORK_ROOT/musl-src
+          cd $WORK_ROOT/musl-src
+          wget -q https://musl.libc.org/releases/musl-$MUSL_VER.tar.gz
+          tar -xf musl-$MUSL_VER.tar.gz
+          cd musl-$MUSL_VER
+          ./configure --prefix=$MUSL_PREFIX
+          make -j$(nproc)
+          make install
+
+      - name: 5. 注入musl编译环境变量
+        run: |
+          echo "PATH=${{ github.workspace }}/musl-toolchain/bin:$PATH" >> $GITHUB_ENV
+          echo "CC=musl-gcc" >> $GITHUB_ENV
+          echo "CXX=musl-g++" >> $GITHUB_ENV
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >> $GITHUB_ENV
+          # 启用高版本gcc
+          echo "BASH_ENV=/opt/rh/devtoolset-9/enable" >> $GITHUB_ENV
+
+      - name: 6. 编译CodeWhale musl静态程序（自动区分C++/Rust/Go）
+        run: |
+          set -e
+          WORK_ROOT=${{ github.workspace }}
+          OUTPUT_DIR=$WORK_ROOT/dist
+          mkdir -p $OUTPUT_DIR
+          rm -rf build-musl && mkdir build-musl
+          cd build-musl
+          source /opt/rh/devtoolset-9/enable
+
+          # CMake C++项目（仓库主流场景）
+          if [ -f "$WORK_ROOT/CMakeLists.txt" ]; then
+            cmake3 .. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=musl-gcc \
+              -DCMAKE_CXX_COMPILER=musl-g++ \
+              -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -s" \
+              -DCMAKE_FIND_LIBRARY_SUFFIXES=".a" \
+              -DCMAKE_CXX_FLAGS="-O3 -DNDEBUG"
+            make -j$(nproc)
+            # 复制可执行文件到产物目录
+            find . -maxdepth 3 -type f -executable -exec cp {} $OUTPUT_DIR \;
+          # Rust 项目
+          elif [ -f "$WORK_ROOT/Cargo.toml" ]; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y
+            source $HOME/.cargo/env
+            rustup target add x86_64-unknown-linux-musl
+            cd $WORK_ROOT
+            cargo build --release --target=x86_64-unknown-linux-musl
+            cp target/x86_64-unknown-linux-musl/release/* $OUTPUT_DIR
+          # Golang 项目（零CGO天然无依赖）
+          elif [ -f "$WORK_ROOT/go.mod" ]; then
+            yum install -y golang
+            cd $WORK_ROOT
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o $OUTPUT_DIR/codewhale
+          else
+            echo "ERROR: 未识别构建文件(CMakeLists/Cargo/go.mod)"
+            exit 1
+          fi
+
+      - name: 7. 产物校验：强制无动态依赖
+        run: |
+          set -e
+          OUTPUT_DIR=${{ github.workspace }}/dist
+          for bin in $OUTPUT_DIR/*; do
+            if [ ! -x "$bin" ]; then continue; fi
+            echo "校验二进制: $bin"
+            # musl全静态二进制 ldd 输出 not a dynamic executable
+            if ldd "$bin" 2>&1 | grep -v "not a dynamic executable"; then
+              echo "FAIL: $bin 存在动态库依赖，构建不合格"
+              ldd "$bin"
+              exit 1
+            fi
+            # strip 进一步瘦身
+            strip "$bin"
+          done
+
+      - name: 8. 上传构建制品（CI下载）
         uses: actions/upload-artifact@v4
         with:
-          path: codewhale-linux-musl-x86_64
+          name: codewhale-musl-centos7-static
+          path: ${{ github.workspace }}/dist
+          retention-days: 30
 
-  # 发布时上传到Release Assets
-  release:
-    needs: build-linux-musl-x64
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-      - name: Upload to GitHub Release
+      - name: 9. Tag推送时自动发布Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            codewhale-linux-musl-x86_64
+          files: ${{ github.workspace }}/dist/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
