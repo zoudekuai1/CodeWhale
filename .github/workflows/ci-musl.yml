@@ -1,4 +1,4 @@
-name: Release Build
+name: Musl Release Build
 on:
   push:
     tags:
